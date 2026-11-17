@@ -8,6 +8,7 @@ import { ProviderCleanupError } from "../domain/providerCleanupError.js";
 
 const command = vi.hoisted(() => {
   let helperMode: "read" | "identities" = "read";
+  let identityAbsent = false;
   let helperSessions: Array<{
     readonly pid: number;
     readonly failed: boolean;
@@ -30,8 +31,9 @@ const command = vi.hoisted(() => {
   };
 
   return {
-    configure(mode: "read" | "identities") {
+    configure(mode: "read" | "identities", absent = false) {
       helperMode = mode;
+      identityAbsent = absent;
       events.length = 0;
       expectedHelpers = 1;
       startedHelpers = 0;
@@ -100,11 +102,24 @@ const command = vi.hoisted(() => {
           results: [
             helperMode === "read"
               ? { pid: session.pid, state: "readable", run_id: "run" }
-              : {
-                  pid: session.pid,
-                  state: "readable",
-                  identity: "start:456",
-                },
+              : identityAbsent
+                ? {
+                    pid: session.pid,
+                    state: "absent",
+                    identity: null,
+                    reason: "not-in-snapshot",
+                  }
+                : {
+                    pid: session.pid,
+                    state: "readable",
+                    identity: "start:456",
+                    lifecycle: "non-zombie",
+                    relation: {
+                      state: "observed",
+                      parent_pid: 1,
+                      process_group_id: 123,
+                    },
+                  },
           ],
         });
         return {
@@ -146,6 +161,38 @@ vi.mock("./ExecFileOutput.js", async (importOriginal) => {
 
 import { createDarwinProcessRunTokenReader } from "./DarwinProcessRunTokenReader.js";
 
+it("decodes a successful native snapshot absence as a distinct identity fact", async () => {
+  command.configure("identities", true);
+  const reader = createDarwinProcessRunTokenReader({
+    compiler: {
+      kind: "swiftc",
+      executable: join(tmpdir(), "fixture-swiftc"),
+      sdkRoot: tmpdir(),
+    },
+    environment: {},
+  });
+  try {
+    const processes = [
+      {
+        pid: 123,
+        parentPid: 1,
+        processGroupId: 123,
+        state: "S",
+        command: "fixture",
+      },
+    ];
+    const operation = reader.identities(processes);
+    await command.waitUntilStarted();
+    command.release();
+    await expect(operation).resolves.toEqual(
+      new Map([[123, { state: "absent", reason: "not-in-snapshot" }]]),
+    );
+  } finally {
+    command.release();
+    await reader.close();
+  }
+});
+
 it.each(["read", "identities"] as const)(
   "waits for an active helper %s before removing its executable root",
   async (mode) => {
@@ -165,26 +212,17 @@ it.each(["read", "identities"] as const)(
       await Promise.allSettled([operation, closing, reader.close()]);
     });
 
+    const processes = [
+      {
+        pid: 123,
+        parentPid: 1,
+        processGroupId: 123,
+        state: "S",
+        command: "fixture",
+      },
+    ];
     operation =
-      mode === "read"
-        ? reader.read([
-            {
-              pid: 123,
-              parentPid: 1,
-              processGroupId: 123,
-              state: "S",
-              command: "fixture",
-            },
-          ])
-        : reader.identities([
-            {
-              pid: 123,
-              parentPid: 1,
-              processGroupId: 123,
-              state: "S",
-              command: "fixture",
-            },
-          ]);
+      mode === "read" ? reader.read(processes) : reader.identities(processes);
     await command.waitUntilStarted();
 
     let closeSettled = false;
@@ -213,30 +251,21 @@ it.each(["read", "identities"] as const)(
           123,
           mode === "read"
             ? { state: "readable", runId: "run" }
-            : { state: "readable", identity: "start:456" },
+            : {
+                state: "readable",
+                identity: "start:456",
+                lifecycle: { state: "observed", lifecycle: "non-zombie" },
+                relation: {
+                  state: "observed",
+                  parentPid: 1,
+                  processGroupId: 123,
+                },
+              },
         ],
       ]),
     );
     await expect(
-      mode === "read"
-        ? reader.read([
-            {
-              pid: 123,
-              parentPid: 1,
-              processGroupId: 123,
-              state: "S",
-              command: "fixture",
-            },
-          ])
-        : reader.identities([
-            {
-              pid: 123,
-              parentPid: 1,
-              processGroupId: 123,
-              state: "S",
-              command: "fixture",
-            },
-          ]),
+      mode === "read" ? reader.read(processes) : reader.identities(processes),
     ).rejects.toThrow("closed");
   },
 );

@@ -1,10 +1,14 @@
 import { withArtifactResourceScope } from "../fixtures/artifactInventory.js";
-import type { ExecutionOptions } from "../../src/application/AnalysisProvider.js";
-import { analyzeJavaScriptApplication as analyzeOwned } from "../../src/application/javascript/JavaScriptApplicationService.js";
+import {
+  analyzeJavaScriptApplication as analyzeOwned,
+  type JavaScriptApplicationOptions,
+} from "../../src/application/javascript/JavaScriptApplicationService.js";
 import { reconstructJavaScriptArtifact as reconstructOwned } from "../../src/application/javascript/JavaScriptArtifactReconstruction.js";
-import type { ProgressReporter } from "../../src/application/ProgressReporter.js";
+import { analyzeJavaScriptApplicationInputSchema } from "../../src/domain/javascript/javascriptApplicationAnalysis.js";
+import type { ProgressReporter } from "../../src/ports/ProgressReporter.js";
+import { javascriptSourceAnalysis } from "../../src/composition/javascriptSourceAnalysis.js";
 import { readJavaScriptArtifactFiles as readOwned } from "../../src/artifacts/javascript/JavaScriptArtifactFiles.js";
-import type { ArtifactReader } from "../../src/artifacts/ArtifactReader.js";
+import type { ArtifactReader } from "../../src/resources/ArtifactReader.js";
 import type { ArtifactInventorySnapshot } from "../../src/domain/artifactInventorySnapshot.js";
 
 /** Read a fixture's nested containers with an awaited cleanup owner. */
@@ -21,8 +25,14 @@ export const readJavaScriptArtifactFiles = (
 /** Run a JavaScript analysis with an awaited, test-owned artifact scope. */
 export const analyzeJavaScriptApplication = (
   input: unknown,
-  options: ExecutionOptions = {},
-) => withArtifactResourceScope((scope) => analyzeOwned(input, scope, options));
+  options: Omit<JavaScriptApplicationOptions, "sourceAnalysis"> = {},
+) =>
+  withArtifactResourceScope((scope) =>
+    analyzeOwned(input, scope, {
+      sourceAnalysis: javascriptSourceAnalysis,
+      ...options,
+    }),
+  );
 
 /** Reconstruct a fixture with an awaited, test-owned artifact scope. */
 export const reconstructJavaScriptArtifact = (
@@ -31,5 +41,11 @@ export const reconstructJavaScriptArtifact = (
   progress?: ProgressReporter,
 ) =>
   withArtifactResourceScope((scope) =>
-    reconstructOwned(rawInput, scope, signal, progress),
+    reconstructOwned(
+      analyzeJavaScriptApplicationInputSchema.parse(rawInput),
+      scope,
+      javascriptSourceAnalysis,
+      signal,
+      progress,
+    ),
   );

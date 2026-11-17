@@ -3,6 +3,8 @@ import { describe, expect, it, vi } from "vitest";
 import { err, ok, type Result } from "../domain/result.js";
 import { ProviderCleanupError } from "../domain/providerCleanupError.js";
 import { GhidraRequestQueue } from "./GhidraRequestQueue.js";
+import { releaseOwnedCleanup } from "../../tests/support/cleanupRelease.js";
+import { phaseGate } from "../../tests/support/lifecycleHarness.js";
 import {
   bindGhidraSessionFailure,
   GhidraSessionError,
@@ -215,25 +217,16 @@ describe("Ghidra request queue cancellation", () => {
   });
 });
 
-const deferred = <Value>() => {
-  let resolve!: (value: Value) => void;
-  let reject!: (cause: unknown) => void;
-  const promise = new Promise<Value>((accept, fail) => {
-    resolve = accept;
-    reject = fail;
-  });
-  return { promise, resolve, reject };
-};
 type ExecutionResult = Result<null, GhidraSessionError>;
 type CleanupResult = Result<null, ProviderCleanupError>;
 const nextTurn = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 it("joins a completed response with cancellation cleanup before reporting cancellation", async () => {
-  const execution = deferred<ExecutionResult>();
-  const cleanup = deferred<CleanupResult>();
-  const stop = vi.fn(() => cleanup.promise);
+  const execution = phaseGate<void, ExecutionResult>();
+  const cleanup = phaseGate<void, CleanupResult>();
+  const stop = vi.fn(() => cleanup.hold());
   const controller = new AbortController();
-  const queue = new GhidraRequestQueue(() => execution.promise, failure, stop);
+  const queue = new GhidraRequestQueue(() => execution.hold(), failure, stop);
   let settled = false;
   const pending = queue
     .run("active", {}, { signal: controller.signal })
@@ -241,11 +234,11 @@ it("joins a completed response with cancellation cleanup before reporting cancel
       settled = true;
       return result;
     });
-  execution.resolve(ok(null));
+  execution.release(ok(null));
   controller.abort(null);
   await nextTurn();
   expect(settled).toBe(false);
-  cleanup.resolve(ok(null));
+  cleanup.release(ok(null));
   const result = await pending;
   expect(result).toMatchObject({
     ok: false,
@@ -254,9 +247,57 @@ it("joins a completed response with cancellation cleanup before reporting cancel
   expect(stop).toHaveBeenCalledTimes(1);
 });
 
+it.each([false, true])(
+  "records the session close on a late remote failure (cleanup failed: %s)",
+  async (cleanupFailed) => {
+    const execution = phaseGate<void, ExecutionResult>();
+    const original = new GhidraSessionError(
+      "remote",
+      "decompile limit reached",
+      { remote_code: "decompile_timed_out" },
+      { remoteCode: "decompile_timed_out" },
+    );
+    const controller = new AbortController();
+    const reason = new Error("client deadline");
+    const cleanupFailure = new ProviderCleanupError(
+      "ghidra",
+      ["owned session"],
+      {
+        reason: "Fixture cleanup needs retry",
+      },
+    );
+    const queue = new GhidraRequestQueue(
+      () => execution.hold(),
+      failure,
+      () => Promise.resolve(cleanupFailed ? err(cleanupFailure) : ok(null)),
+    );
+    const pending = queue.run("active", {}, { signal: controller.signal });
+    controller.abort(reason);
+    execution.release(err(original));
+    const result = await pending;
+    if (result.ok) throw new Error("Expected the remote failure");
+    // The observed failure stays primary; only the session close is added.
+    expect(result.error).toMatchObject({
+      kind: "remote",
+      remoteCode: "decompile_timed_out",
+      message: "decompile limit reached",
+      concurrentCancellation: { reason },
+      diagnostics: {
+        remote_code: "decompile_timed_out",
+        session_closed_by_cancellation: true,
+      },
+    });
+    expect(result.error.cleanupFailure).toBe(
+      cleanupFailed ? cleanupFailure : undefined,
+    );
+    expect(result.error.cancellation).toBeUndefined();
+    expect(original.concurrentCancellation).toBeUndefined();
+  },
+);
+
 it("awaits active cancellation cleanup when execution rejects", async () => {
-  const execution = deferred<ExecutionResult>();
-  const cleanup = deferred<CleanupResult>();
+  const execution = phaseGate<void, ExecutionResult>();
+  const cleanup = phaseGate<void, CleanupResult>();
   const cause = new Error("executor rejected");
   const cleanupFailure = new ProviderCleanupError(
     "ghidra",
@@ -265,9 +306,9 @@ it("awaits active cancellation cleanup when execution rejects", async () => {
   );
   const controller = new AbortController();
   const queue = new GhidraRequestQueue(
-    () => execution.promise,
+    () => execution.hold(),
     failure,
-    () => cleanup.promise,
+    () => cleanup.hold(),
   );
   let settled = false;
   const pending = queue
@@ -280,7 +321,7 @@ it("awaits active cancellation cleanup when execution rejects", async () => {
   execution.reject(cause);
   await nextTurn();
   expect(settled).toBe(false);
-  cleanup.resolve(err(cleanupFailure));
+  cleanup.release(err(cleanupFailure));
   const result = await pending;
   if (result.ok) throw new Error("Expected execution failure");
   expect(result.error).toMatchObject({ kind: "protocol", cause });
@@ -311,9 +352,9 @@ it.each([null, "caller stopped", new Error("caller stopped")])(
   "retains the exact queued cancellation reason %j",
   async (reason) => {
     const controller = new AbortController();
-    const execution = deferred<ExecutionResult>();
+    const execution = phaseGate<void, ExecutionResult>();
     const queue = new GhidraRequestQueue(
-      () => execution.promise,
+      () => execution.hold(),
       failure,
       () => Promise.resolve(ok(null)),
     );
@@ -321,7 +362,7 @@ it.each([null, "caller stopped", new Error("caller stopped")])(
     const queued = queue.run("queued", {}, { signal: controller.signal });
     controller.abort(reason);
     const result = await queued;
-    execution.resolve(ok(null));
+    execution.release(ok(null));
     await active;
     if (result.ok) throw new Error("Expected queued cancellation");
     expect(result.error.cancellation?.reason).toBe(reason);
@@ -347,15 +388,15 @@ it.each([null, "caller stopped", new Error("caller stopped")])(
 it.each(["return", "throw"] as const)(
   "captures cleanup rejection before execution can %s",
   async (stage) => {
-    const execution = deferred<ExecutionResult>();
-    const cleanup = deferred<CleanupResult>();
+    const execution = phaseGate<void, ExecutionResult>();
+    const cleanup = phaseGate<void, CleanupResult>();
     const cause = new Error("early cleanup rejection");
     const original = failure("remote", "Observed operation failure");
     const controller = new AbortController();
     const queue = new GhidraRequestQueue(
-      () => execution.promise,
+      () => execution.hold(),
       failure,
-      () => cleanup.promise,
+      () => cleanup.hold(),
     );
     let settled = false;
     const pending = queue
@@ -368,7 +409,7 @@ it.each(["return", "throw"] as const)(
     cleanup.reject(cause);
     await nextTurn();
     expect(settled).toBe(false);
-    if (stage === "return") execution.resolve(err(original));
+    if (stage === "return") execution.release(err(original));
     else execution.reject(original);
     const result = await pending;
     if (result.ok) throw new Error("Expected operation and cleanup failure");
@@ -381,11 +422,11 @@ it.each(["return", "throw"] as const)(
 );
 
 it("retains cleanup uncertainty when the cancellation cleanup callback throws synchronously", async () => {
-  const execution = deferred<ExecutionResult>();
+  const execution = phaseGate<void, ExecutionResult>();
   const cause = new Error("synchronous cleanup rejection");
   const controller = new AbortController();
   const queue = new GhidraRequestQueue(
-    () => execution.promise,
+    () => execution.hold(),
     failure,
     () => {
       throw cause;
@@ -393,7 +434,7 @@ it("retains cleanup uncertainty when the cancellation cleanup callback throws sy
   );
   const pending = queue.run("active", {}, { signal: controller.signal });
   controller.abort(null);
-  execution.resolve(ok(null));
+  execution.release(ok(null));
   const result = await pending;
   if (result.ok) throw new Error("Expected unconfirmed cancellation cleanup");
   expect(result.error).toMatchObject({
@@ -443,13 +484,13 @@ it.each([
       throw new Error("Expected both cleanup owners");
     const aggregate = result.error.cleanupFailure;
     expect(aggregate.cleanupIncomplete).toBe(true);
-    const owners =
+    const [first, second] =
       order === "execution-first"
         ? [executionCleanup, cancellationCleanup]
         : [cancellationCleanup, executionCleanup];
-    owners[0]?.resolveCleanup();
+    releaseOwnedCleanup(first);
     expect(aggregate.cleanupIncomplete).toBe(true);
-    owners[1]?.resolveCleanup();
+    releaseOwnedCleanup(second);
     expect(aggregate.cleanupIncomplete).toBe(false);
   },
 );

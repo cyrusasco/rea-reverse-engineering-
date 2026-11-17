@@ -1,15 +1,24 @@
+import { getEventListeners } from "node:events";
 import { execFile } from "node:child_process";
-import { chmod, symlink, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  open,
+  symlink,
+  writeFile,
+  type FileHandle,
+} from "node:fs/promises";
 import { join } from "node:path";
+import { Readable } from "node:stream";
 import { promisify } from "node:util";
 
-import { describe, expect, it, onTestFinished } from "vitest";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
 
-import { createCli } from "../../../src/cli.js";
-import { parseCliJsonInput } from "../../../src/cliJsonInput.js";
+import { closeCliResources, createCli } from "../../../src/cli.js";
+import { parseCliJsonInput } from "../../../src/cli/cliJsonInput.js";
+import { cliJavaScriptSourcePaths } from "../../../src/cli/javascriptApplicationAnalysis.js";
 import { readJsonInputFile } from "../../../src/application/JsonInputFile.js";
+import { OwnedFileHandle } from "../../../src/filesystem/OwnedFileHandle.js";
 import { analysisCliErrorEnvelopeSchema } from "../../../src/contracts/errorSchemas.js";
-import { JSON_BYTE_ORDER_MARK_MESSAGE } from "../../../src/application/Utf8JsonInput.js";
 import { readWithoutFifoWriter } from "../../fixtures/fifoInput.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 
@@ -161,6 +170,20 @@ describe("CLI JSON streamed input", () => {
     }
   });
 
+  it("keeps malformed source excerpts out of native and streamed file diagnostics", async () => {
+    const root = await createTestTempDirectory("rea-json-input-excerpt-");
+    const path = join(root, "input.json");
+    for (const prefix of ["", " ".repeat(9 * 1024 * 1024)]) {
+      await writeFile(path, `${prefix}{"$ref":"https://u:p@h","":NaN}`);
+      const result = await parseCliJsonInput(path, "test-input");
+      expect(result).toMatchObject({
+        ok: false,
+        error: { input_reason: "invalid-json" },
+      });
+      expect(JSON.stringify(result)).not.toContain("u:p@h");
+    }
+  });
+
   it("names a leading byte-order mark in small and streamed files", async () => {
     const root = await createTestTempDirectory("rea-json-input-bom-");
     const path = join(root, "input.json");
@@ -170,7 +193,15 @@ describe("CLI JSON streamed input", () => {
         ok: false,
         error: {
           input_reason: "invalid-json",
-          details: { issues: [{ message: JSON_BYTE_ORDER_MARK_MESSAGE }] },
+          details: {
+            issues: [
+              {
+                message: expect.stringMatching(
+                  /byte-order mark.*UTF-8 without a byte-order mark/iu,
+                ),
+              },
+            ],
+          },
         },
       });
     }
@@ -295,7 +326,7 @@ describe("CLI JSON input", () => {
         code: "access_denied",
         category: "unavailable",
         details: {
-          operation: "inspect-analysis-view",
+          operation: "inspect_analysis_view",
           path,
           system_code: "EACCES",
           boundary: "filesystem-read",
@@ -306,4 +337,350 @@ describe("CLI JSON input", () => {
       });
     },
   );
+});
+
+describe("CLI JSON file cancellation", () => {
+  const writeSelection = async (): Promise<string> => {
+    const root = await createTestTempDirectory("rea-json-input-cancel-");
+    const path = join(root, "paths.json");
+    await writeFile(path, JSON.stringify(["main.js", "package.json"]));
+    return path;
+  };
+
+  it("reports a cancelled file read as cancellation, not a file failure", async () => {
+    const path = await writeSelection();
+    const controller = new AbortController();
+    controller.abort();
+    expect(
+      await parseCliJsonInput(path, "test-input", controller.signal),
+    ).toMatchObject({ ok: false, error: { code: "cancelled" } });
+  });
+
+  it("reports cancellation through --source-paths-json selection", async () => {
+    const path = await writeSelection();
+    const controller = new AbortController();
+    controller.abort();
+    expect(
+      await cliJavaScriptSourcePaths(["index.js"], path, controller.signal),
+    ).toMatchObject({ ok: false, error: { code: "cancelled" } });
+  });
+
+  it("still reads the selection when the signal is not aborted", async () => {
+    const path = await writeSelection();
+    expect(
+      await cliJavaScriptSourcePaths(
+        ["index.js"],
+        path,
+        new AbortController().signal,
+      ),
+    ).toEqual({ ok: true, value: ["index.js", "main.js", "package.json"] });
+  });
+});
+
+describe("CLI JSON standard input", () => {
+  it("reads valid JSON from stdin when input is '-'", async () => {
+    const stream = Readable.from(['{"seed":123,"label":"piped"}']);
+    const result = await parseCliJsonInput("-", "test-input", undefined, {
+      stdin: stream,
+    });
+    expect(result).toEqual({
+      ok: true,
+      value: { seed: 123, label: "piped" },
+    });
+  });
+
+  it("rejects empty stdin with invalid-json", async () => {
+    const stream = Readable.from([]);
+    const result = await parseCliJsonInput("-", "test-input", undefined, {
+      stdin: stream,
+    });
+    expect(result).toMatchObject({
+      ok: false,
+      error: {
+        code: "invalid_request",
+        input_path: "-",
+        input_reason: "invalid-json",
+        details: {
+          issues: [{ path: [], reason: "invalid_format" }],
+        },
+      },
+    });
+  });
+
+  it("rejects malformed JSON from stdin without printing full payload", async () => {
+    const stream = Readable.from(["{ this is not valid json"]);
+    const result = await parseCliJsonInput("-", "test-input", undefined, {
+      stdin: stream,
+    });
+    expect(result).toMatchObject({
+      ok: false,
+      error: {
+        code: "invalid_request",
+        input_path: "-",
+        input_reason: "invalid-json",
+        details: {
+          issues: [{ path: [], reason: "invalid_format" }],
+        },
+      },
+    });
+    expect(JSON.stringify(result)).not.toContain("this is not valid json");
+  });
+
+  it("rejects oversized stdin with too-large", async () => {
+    const stream = Readable.from([Buffer.alloc(8 * 1024 * 1024 + 1, 0x78)]);
+    const result = await parseCliJsonInput("-", "test-input", undefined, {
+      stdin: stream,
+    });
+    expect(result).toMatchObject({
+      ok: false,
+      error: {
+        code: "resource_constraint",
+        input_path: "-",
+        input_reason: "too-large",
+        details: {
+          resource: "memory",
+        },
+      },
+    });
+  });
+
+  it("preserves caller cancellation during stdin read", async () => {
+    const controller = new AbortController();
+    controller.abort("aborted");
+    const stream = Readable.from(['{"seed":1}']);
+    const result = await parseCliJsonInput(
+      "-",
+      "test-input",
+      controller.signal,
+      {
+        stdin: stream,
+      },
+    );
+    expect(result).toMatchObject({
+      ok: false,
+      error: {
+        code: "cancelled",
+      },
+    });
+  });
+});
+
+describe("CLI JSON stdin cancellation and encoding", () => {
+  it.each([false, true])(
+    "interrupts an idle stdin read (partial input: %s)",
+    async (partial) => {
+      const controller = new AbortController();
+      let started!: () => void;
+      const reading = new Promise<void>((resolve) => {
+        started = resolve;
+      });
+      const stream = new Readable({
+        read() {
+          started();
+        },
+      });
+      onTestFinished(() => {
+        stream.destroy();
+      });
+      if (partial) stream.push('{"partial":');
+      const pending = parseCliJsonInput("-", "test-input", controller.signal, {
+        stdin: stream,
+      });
+      await reading;
+      // Let any initial chunk be consumed before aborting the next idle read.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      controller.abort("stop idle stdin");
+      await expect(pending).resolves.toMatchObject({
+        ok: false,
+        error: { code: "cancelled" },
+      });
+      expect(stream.destroyed).toBe(true);
+      expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+    },
+  );
+
+  it.each([
+    [
+      Buffer.from("\uFEFF{}"),
+      expect.stringMatching(
+        /byte-order mark.*UTF-8 without a byte-order mark/iu,
+      ),
+    ],
+    [Buffer.from([0xf0, 0x28, 0x8c, 0xbc]), "JSON input is not valid UTF-8"],
+    [Buffer.from([0xe2, 0x82]), "JSON input is not valid UTF-8"],
+  ])(
+    "preserves safe stdin encoding diagnostics (%j)",
+    async (bytes, message) => {
+      expect(
+        await parseCliJsonInput("-", "test-input", undefined, {
+          stdin: Readable.from([bytes]),
+        }),
+      ).toMatchObject({
+        ok: false,
+        error: {
+          input_path: "-",
+          input_reason: "invalid-json",
+          details: { issues: [{ message }] },
+        },
+      });
+    },
+  );
+
+  it("reads UTF-8 split between chunks and accepts the exact byte limit", async () => {
+    const prefix = Buffer.from('{"label":"');
+    const suffix = Buffer.from('中文🦀"}');
+    const padding = Buffer.alloc(
+      8 * 1024 * 1024 - prefix.length - suffix.length,
+      0x61,
+    );
+    const result = await parseCliJsonInput("-", "test-input", undefined, {
+      stdin: Readable.from([
+        prefix,
+        padding,
+        ...[...suffix].map((byte) => Buffer.from([byte])),
+      ]),
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("Expected valid JSON at the stdin limit");
+    expect(result.value).toEqual({
+      label: `${"a".repeat(padding.length)}中文🦀`,
+    });
+  });
+
+  it("projects cancellation during stdin snapshot sealing", async () => {
+    const controller = new AbortController();
+    const stream = Readable.from([
+      JSON.stringify(Array.from({ length: 20_000 }, (_, index) => ({ index }))),
+    ]);
+    stream.once("end", () =>
+      setImmediate(() => controller.abort("stop sealing")),
+    );
+    await expect(
+      parseCliJsonInput("-", "test-input", controller.signal, {
+        stdin: stream,
+        snapshot: true,
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "cancelled" } });
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+  });
+
+  it("seals stdin snapshots and releases the abort listener on success", async () => {
+    const controller = new AbortController();
+    const result = await parseCliJsonInput(
+      "-",
+      "test-input",
+      controller.signal,
+      {
+        stdin: Readable.from(['{"nested":{"value":1}}']),
+        snapshot: true,
+      },
+    );
+    expect(result).toEqual({ ok: true, value: { nested: { value: 1 } } });
+    if (result.ok) expect(Object.isFrozen(result.value)).toBe(true);
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+  });
+
+  it("preserves stdin physical failure and releases the abort listener", async () => {
+    const controller = new AbortController();
+    const stream = new Readable({
+      read() {
+        this.destroy(Object.assign(new Error("read failed"), { code: "EIO" }));
+      },
+    });
+    expect(
+      await parseCliJsonInput("-", "test-input", controller.signal, {
+        stdin: stream,
+      }),
+    ).toMatchObject({
+      ok: false,
+      error: { input_path: "-", input_reason: "read-failed" },
+    });
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+  });
+});
+
+describe("CLI JSON file cleanup", () => {
+  /** Refuse every close, recording each owner so the test can release it. */
+  const refuseCloses = (onClose?: () => void) => {
+    const owners = new Set<OwnedFileHandle>();
+    const close = vi
+      .spyOn(OwnedFileHandle.prototype, "close")
+      .mockImplementation(async function (this: OwnedFileHandle) {
+        owners.add(this);
+        onClose?.();
+        throw new Error("injected file close failure");
+      });
+    onTestFinished(async () => {
+      close.mockRestore();
+      for (const owner of owners) await owner.close();
+    });
+    return { owners, close };
+  };
+
+  const jsonFile = async (prefix: string) => {
+    const root = await createTestTempDirectory(prefix);
+    const path = join(root, "input.json");
+    await writeFile(path, '{"value":1}');
+    return path;
+  };
+
+  it("retains a file whose close fails until final CLI cleanup", async () => {
+    const path = await jsonFile("rea-json-input-close-");
+    const { owners, close } = refuseCloses();
+    expect(await parseCliJsonInput(path, "test-input")).toMatchObject({
+      ok: false,
+      error: {
+        code: "cleanup_incomplete",
+        input_path: path,
+        details: { cleanup: "incomplete", resources: [path] },
+      },
+    });
+    const [owner] = owners;
+    // The handle stays with the process owner rather than being dropped.
+    expect(owner?.handle.fd).toBeGreaterThanOrEqual(0);
+    close.mockRestore();
+    await closeCliResources();
+    expect(owner?.handle.fd).toBe(-1);
+  });
+
+  it("keeps a cancellation recorded during close beside the incomplete cleanup", async () => {
+    const path = await jsonFile("rea-json-input-close-cancel-");
+    const controller = new AbortController();
+    refuseCloses(() => controller.abort("stop"));
+    expect(
+      await parseCliJsonInput(path, "test-input", controller.signal),
+    ).toMatchObject({
+      ok: false,
+      error: {
+        code: "cleanup_incomplete",
+        input_path: path,
+        details: { cleanup: "incomplete", execution_failure: "cancelled" },
+      },
+    });
+  });
+
+  it("keeps a descriptor read failure beside the incomplete cleanup", async () => {
+    const path = await jsonFile("rea-json-input-close-read-");
+    const probe = await open(path);
+    const prototype = Object.getPrototypeOf(probe) as FileHandle;
+    await probe.close();
+    const read = vi
+      .spyOn(prototype, "read")
+      .mockRejectedValue(
+        Object.assign(new Error("injected read failure"), { code: "EIO" }),
+      );
+    onTestFinished(() => read.mockRestore());
+    refuseCloses();
+    expect(await parseCliJsonInput(path, "test-input")).toMatchObject({
+      ok: false,
+      error: {
+        code: "cleanup_incomplete",
+        input_path: path,
+        details: {
+          cleanup: "incomplete",
+          execution_failure: "invalid_request",
+        },
+      },
+    });
+  });
 });
